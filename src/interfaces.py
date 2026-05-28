@@ -170,4 +170,75 @@ class WordEmbedding(ABC, nn.Module):
         """
         pass
 
-    
+    from abc import ABC, abstractmethod
+from typing import Dict, Sequence, Tuple
+
+
+class evaluate(ABC):
+    """
+    Interface cho các lớp đánh giá mô hình tóm tắt văn bản.
+
+    Class triển khai cụ thể cần tính điểm giữa:
+    - reference: bản tóm tắt đúng, ví dụ cột summary
+    - prediction: bản tóm tắt mô hình sinh ra, ví dụ cột pred_summary
+
+    Các độ đo mặc định:
+    - ROUGE-1: unigram overlap
+    - ROUGE-2: bigram overlap
+    - ROUGE-L: longest common subsequence
+    - ROUGE-S: skip-bigram overlap
+    """
+
+    rouge_types: Tuple[str, ...] = (
+        "rouge1",
+        "rouge2",
+        "rougeL",
+        "rougeS",
+    )
+
+    max_skip: int = 4
+
+    @abstractmethod
+    def score_one(
+        self,
+        reference: str,
+        prediction: str,
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Tính điểm ROUGE cho một cặp reference - prediction.
+
+        Returns:
+            {
+                "rouge1": {"precision": ..., "recall": ..., "f1": ...},
+                "rouge2": {"precision": ..., "recall": ..., "f1": ...},
+                "rougeL": {"precision": ..., "recall": ..., "f1": ...},
+                "rougeS": {"precision": ..., "recall": ..., "f1": ...}
+            }
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def score_batch(
+        self,
+        references: Sequence[str],
+        predictions: Sequence[str],
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Tính điểm ROUGE trung bình cho nhiều cặp reference - prediction.
+
+        Args:
+            references: Danh sách bản tóm tắt đúng.
+            predictions: Danh sách bản tóm tắt mô hình sinh ra.
+
+        Returns:
+            Điểm trung bình ROUGE-1, ROUGE-2, ROUGE-L, ROUGE-S.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def reset(self) -> None:
+        """
+        Reset trạng thái nếu evaluator có lưu cache hoặc thống kê tạm.
+        Với ROUGE đơn giản có thể để pass trong class triển khai.
+        """
+        raise NotImplementedError
