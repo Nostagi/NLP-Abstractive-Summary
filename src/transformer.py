@@ -1,9 +1,12 @@
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
 from copy import deepcopy as copy
 
 from .embedding import PositionalEncoding
+from .interfaces import Network
 
 
 # ------------------
@@ -12,11 +15,12 @@ from .embedding import PositionalEncoding
 
 class Encoder(nn.Module):
 
-    def __init__(self, d_model: int, d_ff: int, num_heads: int, num_layers: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, num_layers: int, dropout: float = 0.1):
         super(Encoder, self).__init__()
-        encoder_layer = EncoderBlock(d_model, num_heads, d_ff, dropout)
 
-        self.layers = nn.ModuleList([copy(encoder_layer) for _ in range(num_layers)])    
+        encoder_layer = EncoderBlock(d_model, num_heads, d_ff, dropout)
+        self.layers = nn.ModuleList([copy(encoder_layer) for _ in range(num_layers)])  
+
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
@@ -44,24 +48,24 @@ class Decoder(nn.Module):
         return self.norm(x)
     
     
-class Transformer(nn.Module):
-
+class Transformer(Network):
     def __init__(self, 
                  vocab_size: int,
                  d_model: int,
                  pad_id:int,
-                 word_embedding: nn.Embedding, 
-                 positional_encoding: PositionalEncoding,
-                 encoder: Encoder, 
-                 decoder: Decoder,
-                 target_max_len:int = 1000):
+                 nhead: int,
+                 num_encoder_layers: int,
+                 num_decoder_layers: int,
+                 dim_feedforward: int,
+                 dropout: float = 0.1,
+                 seq_max_len:int = 1000):
         """
         Params:
             - `vocab_size` is the size of vocabulary (the one-hot vector as initial input).
             - `d_model` is the size of embedding vector (or `embed_dim`).
             - `pad_id` is the notation for <PAD>, will be used in sequence normalization.
             - `word_embedding`, `positional_encoding`, `encoder`, `decoder` are the transformer components that need to be pre-defined.
-            - `target_max_len` is the expected maximum length of the model output
+            - `seq_max_len` is the expected maximum length of the input and output sequences
         """
 
         super(Transformer, self).__init__()
@@ -70,23 +74,22 @@ class Transformer(nn.Module):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.pad_id = pad_id
+        self.nhead = nhead
+        self.num_encoder_layers = num_encoder_layers    
+        self.num_decoder_layers = num_decoder_layers
+        self.dim_feedforward = dim_feedforward
+        self.dropout = dropout
+        self.seq_max_length: int = seq_max_len
         
         # Layers
-        self.embedding = word_embedding
-        self.positional_encoding = positional_encoding
+        self.embedding: nn.Embedding = nn.Embedding(vocab_size, d_model)
+        self.positional_encoding: PositionalEncoding = PositionalEncoding(d_model, dropout=0.1, max_seq_len=seq_max_len)
 
-        self.encoder = encoder
-        self.decoder = decoder
+        self.encoder: Encoder = Encoder(d_model, self.nhead, dim_feedforward, num_encoder_layers, dropout)
+        self.decoder: Decoder = Decoder(d_model, self.nhead, dim_feedforward, num_decoder_layers, dropout)
 
-        self.output_projection = nn.Linear(d_model, vocab_size, bias=False)
+        self.output_projection: nn.Linear = nn.Linear(d_model, vocab_size, bias=False)
         self.output_projection.weight = self.embedding.weight
-
-        # Others
-        triag_mask = torch.tril(
-            torch.ones((target_max_len, target_max_len), dtype=torch.bool)
-        )
-
-        self.register_buffer('triag_mask', triag_mask)
 
     def make_padding_mask(self, src: torch.Tensor) -> torch.Tensor:
         """
@@ -95,22 +98,33 @@ class Transformer(nn.Module):
         Input: [batch_size, seq_len, *]
         Output: mask [batch_size, 1, 1, src_len]
         """
-        return (src != self.pad_id).unsqueeze(1).unsqueeze(2)
-
-    def make_casual_mask(self, target: torch.Tensor) -> torch.Tensor:
-        """
-        Tạo mask cho Decoder (kết hợp Padding Mask và Causal Mask).
-
-        Input : tgt [batch_size, target_len]
-        Output: mask [batch_size, 1, target_len, target_len]
-        """
-        # 1. Pad Mask: [batch_size, 1, 1, tgt_len]
-        pad_mask = self.make_padding_mask(target)
-
-        len = pad_mask.size(-1)
+        # 1. Tạo boolean mask để đánh dấu vị trí của <PAD>
+        is_pad = (src == self.pad_id)
+    
+        # 2. Tạo tensor chứa toàn số 0.0 với kiểu float
+        mask = torch.zeros_like(src, dtype=torch.float)
         
-        # 2. Causal Mask: [batch_size, 1, tgt_len, tgt_len]
-        return pad_mask & self.triag_mask[:len, :len]
+        # 3. Fill -inf vào những vị trí is_pad == True
+        mask = mask.masked_fill(is_pad, float('-inf'))
+        
+        # Reshape thành [batch_size, 1, 1, seq_len]
+        mask = mask.unsqueeze(1).unsqueeze(2) 
+        return mask
+
+    def make_causal_mask(self, target_ids: torch.Tensor) -> torch.Tensor:
+
+        seq_len = target_ids.size(1)
+
+        # Tạo ma trận vuông [seq_len, seq_len] toàn 0
+        mask = torch.zeros((seq_len, seq_len), device=target_ids.device)
+        
+        # Che phần phía trên đường chéo bằng âm vô cực
+        # diagonal=1 nghĩa là che từ ngay trên đường chéo chính
+        mask = mask.masked_fill(torch.triu(torch.ones((seq_len, seq_len), device=target_ids.device), diagonal=1).bool(), float('-inf'))
+        
+        # Mở rộng chiều để khớp với (batch_size, num_heads, seq_len, seq_len)
+        mask = mask.unsqueeze(0).unsqueeze(0) # [1, 1, seq_len, seq_len]
+        return mask
 
     def forward(self, source_ids: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -123,7 +137,7 @@ class Transformer(nn.Module):
         """
 
         src_mask = self.make_padding_mask(source_ids)
-        tgt_mask = self.make_casual_mask(target_ids)
+        tgt_mask = self.make_causal_mask(target_ids)
 
         # 1. Embedding + Positional Encoding
         source_embedded = self.positional_encoding(self.embedding(source_ids))
@@ -137,6 +151,95 @@ class Transformer(nn.Module):
         logits = self.output_projection(dec_output)
         
         return logits
+    
+    def get_config(self) -> dict:
+        """
+        Trả về dictionary khớp 100% với tên các tham số trong hàm __init__.
+        """
+        return {
+            "vocab_size": self.vocab_size,
+            "d_model": self.d_model,
+            "nhead": self.nhead,
+            "pad_id": self.pad_id,
+            "num_encoder_layers": self.num_encoder_layers,
+            "num_decoder_layers": self.num_decoder_layers,
+            "dim_feedforward": self.dim_feedforward,
+            "dropout": self.dropout,
+            "seq_max_len": self.seq_max_length
+        }
+    
+    @torch.no_grad()
+    def generate(self, source_ids: torch.Tensor, eos_id: int, device: torch.device = None) -> torch.Tensor:
+        """
+        Hàm sinh tự hồi quy dựa trên kiến trúc forward chuẩn của mô hình.
+        
+        Input:
+            source_ids: [batch_size, source_seq_len]
+            bos_id: ID của thẻ <BOS>
+            eos_id: ID của thẻ <EOS>
+            max_len: Độ dài tối đa của văn bản sinh ra
+            
+        Output:
+            target_ids: [batch_size, generated_seq_len]
+        """
+        self.eval() # Chuyển sang chế độ inference (tắt Dropout)
+        
+        batch_size = source_ids.size(0)
+        source_ids = source_ids.to(device)
+
+        # ==========================================
+        # 1. ENCODER (Chỉ tính toán 1 lần duy nhất)
+        # ==========================================
+        src_mask = self.make_padding_mask(source_ids)
+        
+        # Nhúng (Embed) dữ liệu đầu vào y hệt như trong hàm forward
+        source_embedded = self.positional_encoding(self.embedding(source_ids))
+        
+        # Trích xuất đặc trưng (Memory) từ Encoder
+        enc_output = self.encoder(source_embedded, mask=src_mask)
+
+        # ==========================================
+        # 2. KHỞI TẠO DECODER
+        # ==========================================
+        # Bắt đầu với thẻ <BOS>
+        target_ids = torch.full((batch_size, 1), self.pad_id, dtype=torch.long, device=device)
+
+        # ==========================================
+        # 3. VÒNG LẶP AUTO-REGRESSIVE (Sinh từng từ)
+        # ==========================================
+        for _ in range(self.seq_max_length):
+            # 3.1. Tạo Causal Mask cho độ dài target hiện tại
+            tgt_mask = self.make_causal_mask(target_ids)
+
+            # 3.2. Nhúng chuỗi target hiện tại (Biến ID thành Vector)
+            target_embedded = self.positional_encoding(self.embedding(target_ids))
+
+            # 3.3. Đưa qua Decoder
+            dec_output = self.decoder(
+                target_embedded, 
+                enc_output,             # Kết quả từ Encoder ở bước 1
+                source_mask=src_mask, 
+                target_mask=tgt_mask
+            )
+
+            # 3.4. Đưa qua lớp Linear để dự đoán từ tiếp theo
+            logits = self.output_projection(dec_output) # [batch_size, current_seq_len, vocab_size]
+
+            # Lấy xác suất của token ở vị trí cuối cùng
+            next_token_logits = logits[:, -1, :] # [batch_size, vocab_size]
+            
+            # Chọn token có xác suất cao nhất (Greedy Search)
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True) # [batch_size, 1]
+
+            # 3.5. Cập nhật chuỗi target
+            target_ids = torch.cat([target_ids, next_token], dim=1)
+
+            # 3.6. Điều kiện dừng: Bắt gặp thẻ <EOS>
+            # (Hàm .all() đảm bảo nếu batch_size > 1, tất cả các câu đều phải sinh ra EOS mới dừng)
+            if (next_token == eos_id).all():
+                break
+
+        return target_ids
 
 # ------------------
 # Bigger blocks
@@ -168,12 +271,12 @@ class EncoderBlock(nn.Module):
         Output:
             [batch_size, seq_len, d_model]
         """
-        x = self.norm1(x)
-        x_output = self.self_attention(q=x, k=x, v=x, mask=mask)
+        x_norm = self.norm1(x)
+        x_output = self.self_attention(q=x_norm, k=x_norm, v=x_norm, mask=mask)
         x = x + self.dropout1(x_output)  # Residual connection + LayerNorm
 
-        x = self.norm2(x)
-        x_output = self.feed_forward(x)
+        x_norm = self.norm2(x)
+        x_output = self.feed_forward(x_norm)
         x = x + self.dropout2(x_output)  # Residual connection + LayerNorm
 
         return x
@@ -204,21 +307,21 @@ class DecoderBlock(nn.Module):
     def forward(self, x: torch.Tensor, enc_output: torch.Tensor, 
                 source_mask: torch.Tensor = None, target_mask: torch.Tensor = None) -> torch.Tensor:
 
-        x = self.norm1(x)
-        x_output = self.self_attn(q=x, k=x, v=x, mask=target_mask)
-        x_output = x + self.dropout1(x_output)  # Residual connection + LayerNorm
+        x_norm = self.norm1(x)
+        x_output = self.self_attn(q=x_norm, k=x_norm, v=x_norm, mask=target_mask)
+        x = x + self.dropout1(x_output)  # Residual connection + LayerNorm
         
 
         # Q: là x (thông tin từ Decoder)
         # K, V: là enc_output (thông tin từ Encoder)
-        x = self.norm2(x)
-        x_output = self.cross_attn(q=x, k=enc_output, v=enc_output, mask=source_mask)
-        x_output = x + self.dropout2(x_output)  # Residual connection + LayerNorm
+        x_norm = self.norm2(x)
+        x_output = self.cross_attn(q=x_norm, k=enc_output, v=enc_output, mask=source_mask)
+        x = x + self.dropout2(x_output)  # Residual connection + LayerNorm
 
         
-        x = self.norm3(x)
-        x_output = self.ffn(x)
-        x_output = x + self.dropout3(x_output)  # Residual connection + LayerNorm
+        x_norm = self.norm3(x)
+        x_output = self.ffn(x_norm)
+        x = x + self.dropout3(x_output)  # Residual connection + LayerNorm
         
         return x
 
@@ -304,16 +407,16 @@ class ScaledDotProductAttention(nn.Module):
         q, k, v shape: [batch_size, num_heads, seq_len, d_model]
         """
 
-        d_k = k.size(-1);
+        d_k = q.size(-1);
 
         # 1. Tính Q * K^T (Tích vô hướng)
         # Hàm .transpose(-2, -1) lật 2 chiều cuối cùng của ma trận K để có thể nhân ma trận
         # Kết quả: [batch, heads, seq_len, seq_len]
-        scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(d_k, dtype=torch.float16))
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
 
         # 3. Masking (Che đi các phần tử không muốn mô hình nhìn thấy - <PAD>)
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9) # qua softmax thì e^-1e9 ~ 0
+            scores = scores + mask
 
         # 4. Softmax
         # Tính xác suất dọc theo chiều cuối cùng (dim=-1)
@@ -347,7 +450,6 @@ class MultiHeadAttention(nn.Module):
         
         # Tái sử dụng single-head attention
         self.attention = ScaledDotProductAttention(dropout)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor = None):
         batch_size = q.size(0)
@@ -366,17 +468,17 @@ class MultiHeadAttention(nn.Module):
         V = V.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
         
         # 3. Tính Attention trên nhiều heads (cùng lúc)
-        x, attention_weights = self.attention(Q, K, V, mask)
+        scores, attention_weights = self.attention(Q, K, V, mask)
         
         # 4. GỘP HEADS LẠI
         # x đang có shape: [batch_size, num_heads, seq_len, d_k]
         # Bước A: transpose(1, 2) đưa về lại [batch_size, seq_len, num_heads, d_k]
         # Bước B: contiguous() là lệnh bắt buộc của PyTorch để sắp xếp lại bộ nhớ sau khi transpose
         # Bước C: view() gộp (num_heads * d_k) ngược trở lại thành d_model
-        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        concat = scores.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
         
         # 5. Đi qua lớp Linear cuối cùng để ra output
         # Final Shape: [batch_size, seq_len, d_model]
-        output = self.w_o(x)
+        output = self.w_o(concat)
         
         return output

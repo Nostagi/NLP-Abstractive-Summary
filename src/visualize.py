@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import pandas as pd
 
-def LossVisualize(loss_series: pd.Series, 
+def visualizeLoss(loss_series: pd.Series, 
                   plt_name:str = 'Biểu Đồ Thay Đổi Loss Quá Trình Huấn Luyện', 
                   save_path: str = None, 
                   window_size: int = None):
@@ -64,3 +64,4 @@ def LossVisualize(loss_series: pd.Series,
     plt.close(fig) 
     
     return fig
+

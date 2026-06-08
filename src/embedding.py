@@ -1,38 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
-from copy import deepcopy as copy
 
-class SGNSTrainer(nn.Module):
-
-    def __init__(self, embedding: nn.Embedding):
-        super(SGNSTrainer, self).__init__()
-
-        self.u_embedding = embedding
-        self.v_embedding = copy(embedding)
-
-    def forward(self, center: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
-        """
-        center:     [batch_size]
-        positive:   [batch_size]
-        negative:   [batch_size, negative_size]
-        """
-
-        center_emb = self.u_embedding(center)          # [batch_size, embed_dim]
-        positive_emb = self.v_embedding(positive)      # [batch_size, embed_dim]
-        negative_emb = self.v_embedding(negative)      # [batch_size, negative_size, embed_dim]
-
-        pos_score = (positive_emb * center_emb).sum(dim=1)                       # [batch_size]
-        neg_score = (negative_emb * center_emb.unsqueeze(1)).sum(dim=2)         # [batch_size, negative_size]
-
-        pos_loss = F.logsigmoid(pos_score).squeeze()    # [batch_size]
-        neg_loss = F.logsigmoid(-neg_score).sum(dim=1)  # [batch_size]
-
-        total_loss = -(pos_loss + neg_loss).mean()  # [batch_size]
-
-        return total_loss  
-    
     
 class PositionalEncoding(nn.Module):
 
@@ -54,9 +23,10 @@ class PositionalEncoding(nn.Module):
 
         self.register_buffer('pe', pe)
         self.dropout = nn.Dropout(dropout)
+        self.d_model = d_model
 
     def forward(self, seq_v: torch.Tensor) -> torch.Tensor:
 
-        x = seq_v + self.pe[:, :seq_v.size(1)]
+        x = seq_v * math.sqrt(self.d_model) + self.pe[:, :seq_v.size(1)]
 
         return self.dropout(x)

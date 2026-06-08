@@ -1,157 +1,131 @@
-from .interfaces import Vocabulary, Tokenizer, ModelConfig, SpecialTokens
-from collections import Counter
-import re
-import numpy as np
+from .interfaces import ModelConfig
 
-class SimpleTokenizer(Tokenizer):
+import pandas as pd
+import os
+from typing import List, Iterator
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.decoders import BPEDecoder
+from tokenizers.normalizers import Lowercase
+from tokenizers.normalizers import Sequence as NormalizerSequence
+from tokenizers.pre_tokenizers import Whitespace, Punctuation
+from tokenizers.pre_tokenizers import Sequence as PreTokenizerSequence
+    
 
-    def __init__(self, config: ModelConfig):
-        self.special_tokens: SpecialTokens = config.special_tokens
-        self.lowercase = config.lowercase
-        self.remove_punctuation = config.remove_punctuation
-
-        self.punctuation_pattern = config.punctuation_pattern
-        self.sentence_pattern = config.split_sentence_pattern
-        self.token_pattern = config.split_token_pattern
-
-    def normalize(self, sentence: str) -> str:
-
-        if self.lowercase:
-            sentence = sentence.lower()
-
-        if self.remove_punctuation:
-            sentence = re.sub(
-                self.punctuation_pattern,
-                ' ',
-                sentence
-            )
-
-        sentence = re.sub(r'\s+', ' ', sentence).strip()
-
-        return sentence
-
-    def tokenize(self, paragraph: str) -> list[str]:
-
-        result = [self.special_tokens.bop_token]
-
-        sentences = self.sentence_pattern.split(paragraph)
-
-        for sentence in sentences:
-
-            sentence = self.normalize(sentence)
-
-            if not sentence:
-                continue
-
-            tokens = self.token_pattern.findall(sentence)
-
-            if not tokens:
-                continue
-
-            result.append(self.special_tokens.bos_token)
-            result.extend(tokens)
-            result.append(self.special_tokens.eos_token)
-
-        result.append(self.special_tokens.eop_token)
-
-        return result
-
-
-class SimpleVocabulary(Vocabulary):
+class BPETokenizer:
     """
-    A Simple implementation of the Vocabulary interface for Vietnamese text.
-    Function: Token -> Lookup table -> ID.
-
-    Input:  List of sentences (tokenized)
-    Output: Vocabulary (token to ID mapping, ID to token list, token count list)
+    Class quản lý Tokenizer sử dụng thuật toán Byte-Pair Encoding (BPE).
+    Được tối ưu hóa bằng lõi Rust của thư viện Hugging Face 'tokenizers'.
     """
 
     def __init__(self, config: ModelConfig):
-        self.special_tokens: SpecialTokens = config.special_tokens
-
-        self.vocab_size = config.vocab_size
-
-        self._reset()
-
-    def _reset(self):
-        self.token_to_id = {}
-        self.tokens = []
-        self.token_counts = []
-
-    def build_vocabulary(self, tokenized_paragraphs: list[list[str]]) -> list[str]:
         """
-        Builds the vocabulary from a list of tokenized paragraphs.
-        Params: [Corpura] -> [Paragraph (tokenized)]
-        """
-        self._reset()
+        Khởi tạo kiến trúc cho BPETokenizer.
         
-        for _, token in self.special_tokens.__dict__.items():
-            self.add_token(token, count=0)
+        Args:
+            config (ModelConfig): Đối tượng chứa các tham số cấu hình cho tokenizer.
+        """
+        self.vocab_size = config.vocab_size
+        self.special_tokens = config.special_tokens
 
-        for paragraph in tokenized_paragraphs:
-            counter = Counter(paragraph)
-            for token, count in counter.items():
-                self.add_token(token, count)
+        # 1. Khởi tạo mô hình BPE trống (chưa có từ điển)
+        self.tokenizer = Tokenizer(BPE(unk_token=self.special_tokens.unk_token))
 
-        n = len(self.special_tokens.__dict__)
+        # 2. Cài đặt Normalizer: Chuẩn hóa văn bản (ví dụ: đưa về chữ thường)
+        # Sequence cho phép bạn nối nhiều bộ chuẩn hóa lại với nhau
+        self.tokenizer.normalizer = NormalizerSequence([Lowercase()]) if config.lowercase else None
 
-        # sort tokens by frequency
-        sorted_pairs = sorted(
-            zip(
-                self.tokens[n:],
-                self.token_counts[n:]
-            ),
-            key=lambda x: x[1],
-            reverse=True
+        # 3. Cài đặt Pre-tokenizer kết hợp Whitespace và Punctuation
+        self.tokenizer.pre_tokenizer = PreTokenizerSequence([Whitespace(), Punctuation()])
+
+        # 4. Cài đặt Decoder: Giúp ghép các Subword lại thành văn bản hoàn chỉnh khi decode
+        self.tokenizer.decoder = BPEDecoder(suffix="</w>")
+
+    def train_from_iterator(self, iterator: Iterator[str]) -> None:
+        """
+        Huấn luyện Tokenizer (xây dựng từ điển và các luật merge) từ một tập dữ liệu văn bản.
+        
+        Args:
+            iterator (Iterator[str]): Generator hoặc List chứa các câu văn bản raw.
+        """
+        print(f"[Info] Đang huấn luyện BPE Tokenizer với vocab_size={self.vocab_size}...")
+        
+        # Khởi tạo Trainer với kích thước từ điển và danh sách special tokens
+        trainer = BpeTrainer(
+            vocab_size=self.vocab_size,
+            special_tokens=self.special_tokens.as_list(),
+            end_of_word_suffix="</w>",
+            show_progress=True
         )
 
-        # Select top tokens
-        total_count = sum(self.token_counts)
-        sorted_pairs = sorted_pairs[:self.vocab_size-n]
+        # Bắt đầu train
+        self.tokenizer.train_from_iterator(iterator, trainer=trainer)
+        print(f"[Info] Hoàn tất huấn luyện! Kích thước từ điển thực tế: {self.tokenizer.get_vocab_size()}")
 
-        # Rebuild token_to_id and tokens list
-        self.tokens = self.tokens[:n] + [token for token, _ in sorted_pairs]
-        self.token_counts = self.token_counts[:n] + [count for _, count in sorted_pairs]
-        self.token_to_id = {
-            token: idx
-            for idx, token in enumerate(self.tokens)
-        }
+    def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
+        """
+        Chuyển đổi một chuỗi văn bản thành danh sách các token IDs.
+        Ủy thác hoàn toàn việc kẹp special token cho lõi Rust.
+        """
+        # Thư viện gốc đã hỗ trợ tham số add_special_tokens
+        return self.tokenizer.encode(text, add_special_tokens=add_special_tokens).ids
 
-        # Add the discard counting back as <UNK>
-        discard_count = total_count - sum(self.token_counts)
-        self.add_token(self.special_tokens.unk_token, discard_count)
+    def encode_batch(self, texts: List[str], add_special_tokens: bool = True) -> List[List[int]]:
+        """
+        Encode hàng loạt câu cùng lúc (Tận dụng tối đa đa luồng của Rust).
+        """
+        outputs = self.tokenizer.encode_batch(texts, add_special_tokens=add_special_tokens)
+        return [output.ids for output in outputs]
 
-    def token_distribution(self):
-        count = np.array(self.token_counts)
-        n = len(self.special_tokens.__dict__)
-        count[0:n] = 0
-
-        return count / count.sum()
-
-    def add_token(self, token: str, count: int = 1):
-        if token in self.token_to_id:
-            id = self.token_to_id[token]
-            self.token_counts[id] += count
-        else:
-            id = len(self.tokens)
-            self.token_to_id[token] = id
-            self.tokens.append(token)
-            self.token_counts.append(count)
-
-    def to_id(self, token: str) -> int:
-        """Returns the ID of a token."""
-        return self.token_to_id.get(token, self.token_to_id[self.special_tokens.unk_token]) 
+    def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
+        """
+        Dịch ngược từ danh sách IDs về lại văn bản con người đọc được.
+        """
+        # Hàm này hiện tại của bạn đã rất ngắn gọn và chuẩn xác rồi
+        return self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
     
-    def to_token(self, id: int) -> str:
-        """Returns the token corresponding to an ID."""
-        if 0 <= id < len(self.tokens):
-            return self.tokens[id]
-        else:
-            return self.special_tokens.unk_token
+    def token_to_id(self, token: str) -> int:
+        """Lấy ID của một token string."""
+        return self.tokenizer.token_to_id(token)
+
+    def id_to_token(self, id: int) -> str:
+        """Lấy string token tương ứng với ID."""
+        return self.tokenizer.id_to_token(id)
+
+    def save(self, base_dir: str) :
+    
+        save_folder = os.path.join(base_dir, "tokenizer")
+        os.makedirs(save_folder, exist_ok=True)
+
+        # 1. Trích xuất và lưu riêng Vocab ra file CSV
+        csv_path = os.path.join(save_folder, "vocab.csv")
+        vocab_dict = self.tokenizer.get_vocab() # Trả về dictionary {token: id}
+        df_vocab = pd.DataFrame(list(vocab_dict.items()), columns=['Token', 'ID']).set_index('ID').sort_index()
+
+        # 2. Lưu toàn bộ pipeline của Tokenizer (JSON chuẩn của Hugging Face)
+        json_path = os.path.join(save_folder, "tokenizer.json")
+        self.tokenizer.save(json_path)
+        df_vocab.to_csv(csv_path, index=False)
         
-    def __len__(self) -> int:
-        return len(self.tokens)
-    
-    @property
-    def pad_idx(self):
-        return self.to_id(self.special_tokens.pad_token)
+        print(f"[Info] Đã lưu cấu trúc Tokenizer và Vocab (CSV) tại: {save_folder}")
+        return df_vocab
+
+    @classmethod
+    def load(cls, save_folder: str, config:ModelConfig=None) -> 'BPETokenizer':
+        """
+        Tải lại Tokenizer từ folder đã lưu (chỉ cần đọc file JSON).
+        """
+        json_path = os.path.join(save_folder, "tokenizer.json")
+
+        if config is None:
+            config = ModelConfig()
+        
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"[ERROR] Không tìm thấy file tokenizer.json tại: {save_folder}")
+            
+        instance = cls(config)
+        instance.tokenizer = Tokenizer.from_file(json_path)
+        print(f"[Info] Đã tải thành công Tokenizer từ: {save_folder}")
+        
+        return instance

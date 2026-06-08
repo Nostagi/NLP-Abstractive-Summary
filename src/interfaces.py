@@ -1,244 +1,164 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import astuple, dataclass, field
+from typing import Dict, List
+import os
+import json
 import torch
 from torch import nn
-import re
-import numpy as np
-import pandas as pd
 
 @dataclass
 class SpecialTokens:
-    pad_token: str = "<PAD>"
-    unk_token: str = "<UNK>"
-    bos_token: str = "<BOS>"    # beginning of sentence
-    eos_token: str = "<EOS>"    # end of sentence
-    bop_token: str = "<BOP>"    # beginning of paragraph
-    eop_token: str = "<EOP>"    # end of paragraph
+    pad_token: str = "<pad>"
+    unk_token: str = "<unk>"
+    eos_token: str = "</s>"    # end of sentence (sample)
+
+    def as_list(self) -> List[str]:
+        return list(astuple(self))
 
 @dataclass
 class ModelConfig:
     lowercase: bool = True
-    remove_punctuation: bool = False
-    dropout_prob: float = 0.3
+    dropout_prob: float = 0.1
 
-    # regex dùng để tách token
-    split_sentence_pattern = re.compile(
-        r'(?<=[.!?])\s+',
-        re.UNICODE
-    )
-
-    # split token tiếng Việt cơ bản
-    split_token_pattern = re.compile(
-        r"""
-        \d+(?:[.,:/-]\d+)*                 # numbers, dates, times
-        | [^\W\d_]+(?:[-'][^\W\d_]+)*     # words
-        | [^\w\s]                         # punctuation / symbols
-        """,
-        re.VERBOSE | re.UNICODE
-    )
-
-    # punctuation unicode-aware
-    punctuation_pattern = r'[^\w\s]'
+    vocab_size: int = 30000
+    embed_dim: int = 512
+    max_target_length: int = 1000
 
     special_tokens: SpecialTokens = field(default_factory=SpecialTokens)
 
-    vocab_size: int = 30000
-    vocab_min_count: int = 5        # deprecated
-
-    embed_dim: int = 512
-
-    max_target_length: int = 1000
-
-
-
-# -------------------------
-# Pre-Process Pipeline: Vocabulary and Tokenizer Interfaces
-#
-# Input:    Corpura (raw text - paragraphs)
-# Output:   Tokenized corpora (list of sentences, each sentence is a list of tokens)
-#           Vocabulary (token to ID mapping, ID to token list, token frequency)
-# -------------------------
-
-class Tokenizer(ABC):
-    """
-    Interface for tokenization and normalization of text.
-
-    Input:  Paragraph (str)
-    Output: List of tokens.
-    """
-
-    @abstractmethod
-    def tokenize(self, paragraph: str) -> list[str]:
-        """Tokenizes a paragraph into a list of tokens"""
-        pass
-
-    def tokenize_batch(self, paragraphs: list[str]) -> list[list[str]]:
-        """Tokenizes a batch of paragraphs."""
-        tokenized_paragraphs = []
-        
-        for paragraph in paragraphs:
-            tokenized_paragraphs.append(self.tokenize(paragraph))
-            
-        return tokenized_paragraphs
-
-class Vocabulary(ABC):
-    """
-    Interface for building a vocabulary from tokenized corpora.
-
-    Input:  Tokenized corpora (list of sentences, each sentence is a list of tokens)
-    Output: Vocabulary (token to ID mapping, ID to token list, token frequency)
-    """
-
-    @abstractmethod
-    def __len__(self) -> int:
-        pass
-    
-    @abstractmethod
-    def pad_idx(self) -> int:
-        pass
-
-    @abstractmethod
-    def build_vocabulary(self, tokenized_corpora: list[list[str]], min_count: int, max_vocab_size: int) -> list[str]:
-        """
-        Builds the vocabulary from the tokenized corpora.
-        Input: corpora (in tokenized form)
-        Output: list of unique tokens (vocabulary) with their index as ID.
-        """
-        pass
-
-    @abstractmethod
-    def token_distribution(self) -> np.array:
-        pass
-
-    @abstractmethod
-    def to_id(self, token: str) -> int:
-        """Returns the ID of a token."""
-        pass
-
-    @abstractmethod
-    def to_token(self, id: int) -> str:
-        """Returns the token corresponding to an ID."""
-        pass
-
-    def token_to_id_sample(self, paragraph: list[str]) -> list[int]:
-        return [self.to_id(token) for token in paragraph]
-
-    def id_to_token_sample(self, paragraph: list[int]) -> list[str]:
-        return [self.to_token(id) for id in paragraph]
-
-    def token_to_id_batch(self, paragraphs: list[list[str]]) -> list[list[int]]:
-        """Converts a batch of tokens to their corresponding IDs."""
-        return [self.token_to_id_sample(p) for p in paragraphs]
-    
-    def id_to_token_batch(self, paragraphs: list[list[str]]) -> list[list[str]]:
-        """Converts a batch of IDs to their corresponding tokens."""
-        return [self.id_to_token_sample(p) for p in paragraphs]
-    
-
-
-# -------------------------
-# Word Embeddings Interface
-# 
-# Input:    Corpura (raw text - paragraphs)
-#           Vocabulary (token to id mapping)
-# Output:   Word Embeddings (token to vector mapping, ID to vector list)
-# ------------------------
-    
-
-class WordEmbedding(ABC, nn.Module):
-    """
-    Interface for creating an embedding layer that maps tokens to their corresponding vector representations.
-
-    Input:  Vocabulary (token to ID mapping)
-    Output: Word Embeddings (token to vector mapping, ID to vector list)
-    """
-
-    @abstractmethod
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Returns the embedding vectors for a batch of token IDs.
-        
-        Input: token_ids [batch_size, seq_length]
-        Output: embeddings [batch_size, seq_length, embedding_dim]
-        """
-        pass
-
-    @abstractmethod
-    def get_embedding_matrix(self) -> torch.Tensor:
-        """
-        Extracts the embedding matrix E for other use.
-        """
-        pass
-
-    from abc import ABC, abstractmethod
-from typing import Dict, Sequence, Tuple
-
-
-class evaluate(ABC):
-    """
-    Interface cho các lớp đánh giá mô hình tóm tắt văn bản.
-
-    Class triển khai cụ thể cần tính điểm giữa:
-    - reference: bản tóm tắt đúng, ví dụ cột summary
-    - prediction: bản tóm tắt mô hình sinh ra, ví dụ cột pred_summary
-
-    Các độ đo mặc định:
-    - ROUGE-1: unigram overlap
-    - ROUGE-2: bigram overlap
-    - ROUGE-L: longest common subsequence
-    - ROUGE-S: skip-bigram overlap
-    """
-
-    rouge_types: Tuple[str, ...] = (
-        "rouge1",
-        "rouge2",
-        "rougeL",
-        "rougeS",
-    )
-
-    max_skip: int = 4
-
-    @abstractmethod
-    def score_one(
-        self,
-        reference: str,
-        prediction: str,
-    ) -> Dict[str, Dict[str, float]]:
-        """
-        Tính điểm ROUGE cho một cặp reference - prediction.
-
-        Returns:
-            {
-                "rouge1": {"precision": ..., "recall": ..., "f1": ...},
-                "rouge2": {"precision": ..., "recall": ..., "f1": ...},
-                "rougeL": {"precision": ..., "recall": ..., "f1": ...},
-                "rougeS": {"precision": ..., "recall": ..., "f1": ...}
+    evaluation_config: Dict = field(default_factory=lambda: {
+            "rouge": {
+                "rouge_types": ["rouge1", "rouge2", "rouge3", "rougeLsum"],
+                "use_stemmer": True
+            },
+            "bertscore": {
+                # Vì tóm tắt tiếng Việt, ta nên dùng PhoBERT để đo khoảng cách ngữ nghĩa
+                "model_type": "vinai/phobert-base", 
+                "num_layers": 9 # Tham số sâu của BERTScore (optional)
             }
+        }
+        )
+
+
+
+
+# -------------------------
+# Network (Model) Base Class
+#
+# Cung cấp sơ bộ các hàm save/load model.
+#  
+# Input:    Indices (token IDs) của câu tóm tắt được tạo ra bởi Tokenizer
+# Output:   Indices (token IDs) của câu tóm tắt được tạo ra bởi mô hình
+# ------------------------
+
+class Network(ABC, nn.Module):
+    
+    @abstractmethod
+    def get_config(self) -> dict:
         """
-        raise NotImplementedError
+        Hàm trừu tượng: Các model kế thừa phải trả về một dictionary chứa 
+        các tham số dùng để khởi tạo model (trong hàm __init__).
+        """
+        pass
+
+    def save_state(self, base_dir: str, version: str = "default", optimizer=None, scheduler=None) -> str:
+        """
+        Lưu trạng thái và cấu hình mạng vào một folder con sinh theo thời gian thực.
+        
+        Args:
+            base_dir: Thư mục gốc chứa các bản lưu.
+            filename: tên đánh dấu phiên bản.
+            optimizer: Đối tượng optimizer từ PyTorch (tùy chọn).
+            scheduler: Đối tượng learning rate scheduler từ PyTorch (tùy chọn).
+        Returns:
+            save_folder: Đường dẫn tới thư mục vừa được tạo.
+        """
+        # Tạo tên folder theo thời gian (VD: 20231025_143000)
+        save_folder = os.path.join(base_dir, "_" + version)
+        
+        os.makedirs(save_folder, exist_ok=True)
+        
+        # 1. Lưu trọng số (state_dict)
+        weights_path = os.path.join(save_folder, "model_state.pth")
+        torch.save(self.state_dict(), weights_path)
+        
+        # 2. Lưu cấu trúc (config) dưới dạng file JSON
+        config_path = os.path.join(save_folder, "model_config.json")
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(self.get_config(), f, indent=4)
+
+        # 3. Lưu trạng thái Optimizer (nếu có)
+        if optimizer is not None:
+            optimizer_path = os.path.join(save_folder, "optimizer_state.pth")
+            torch.save(optimizer.state_dict(), optimizer_path)
+            
+        # 4. Lưu trạng thái Scheduler (nếu có)
+        if scheduler is not None:
+            scheduler_path = os.path.join(save_folder, "scheduler_state.pth")
+            torch.save(scheduler.state_dict(), scheduler_path)
+            
+        print(f"[Info] Đã lưu model thành công tại: {save_folder}")
+        return save_folder
+
+    @classmethod
+    def load_state(cls, save_folder: str, device: str = 'cpu'):
+        """
+        Đọc cấu hình, tái tạo kiến trúc và nạp trọng số từ folder đã lưu.
+        
+        Args:
+            save_folder: Đường dẫn tới thư mục lưu trữ (thư mục chứa pth và json).
+            device: Nơi chứa model ('cpu' hoặc 'cuda').
+        Returns:
+            Mô hình đã được nạp sẵn kiến trúc và trọng số.
+        """
+        weights_path = os.path.join(save_folder, "model_state.pth")
+        config_path = os.path.join(save_folder, "model_config.json")
+        optimizer_path = os.path.join(save_folder, "optimizer_state.pth")
+        scheduler_path = os.path.join(save_folder, "scheduler_state.pth")
+        
+        if not os.path.exists(weights_path) or not os.path.exists(config_path):
+            raise FileNotFoundError(f"[ERROR] Không tìm thấy đủ file pth và json tại: {save_folder}")
+            
+        # 1. Đọc config
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+            
+        # 2. Khởi tạo lại object từ class gọi hàm bằng unpacked kwargs (**config)
+        # Tương đương với: model = Transformer(vocab_size=..., d_model=...)
+        model = cls(**config)
+        
+        # 3. Nạp trọng số
+        state_dict = torch.load(weights_path, map_location=torch.device(device), weights_only=True)
+        model.load_state_dict(state_dict)
+        model.to(device)
+        
+        optimizer_state = None
+        if os.path.exists(optimizer_path):
+            optimizer_state = torch.load(optimizer_path, map_location=torch.device(device))
+        
+        scheduler_state = None
+        if os.path.exists(scheduler_path):
+            scheduler_state = torch.load(scheduler_path, map_location=torch.device(device))
+            
+        print(f"[Info] Đã tái tạo và tải trạng thái mô hình thành công từ: {save_folder}")
+        if optimizer_state:
+            print("       - Tìm thấy trạng thái Optimizer.")
+        if scheduler_state:
+            print("       - Tìm thấy trạng thái Scheduler.")
+            
+        return model, optimizer_state, scheduler_state
 
     @abstractmethod
-    def score_batch(
-        self,
-        references: Sequence[str],
-        predictions: Sequence[str],
-    ) -> Dict[str, Dict[str, float]]:
+    def generate(self, source_ids: torch.Tensor, bos_id: int, eos_id: int, max_len: int = 150, device: torch.device = None) -> torch.Tensor:
         """
-        Tính điểm ROUGE trung bình cho nhiều cặp reference - prediction.
+        Hàm trừu tượng: Các model kế thừa phải cài đặt hàm này để sinh ra câu tóm tắt từ input token IDs.
 
         Args:
-            references: Danh sách bản tóm tắt đúng.
-            predictions: Danh sách bản tóm tắt mô hình sinh ra.
+            source_ids: Tensor chứa token IDs của câu gốc (shape: [batch_size, seq_len]).
+            bos_id: ID của token <BOS>.
+            eos_id: ID của token <EOS>.
+            max_len: Độ dài tối đa của câu tóm tắt được sinh ra.
+            device: Thiết bị để thực hiện tính toán (CPU hoặc GPU).
+        """
+        pass
 
-        Returns:
-            Điểm trung bình ROUGE-1, ROUGE-2, ROUGE-L, ROUGE-S.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def reset(self) -> None:
-        """
-        Reset trạng thái nếu evaluator có lưu cache hoặc thống kê tạm.
-        Với ROUGE đơn giản có thể để pass trong class triển khai.
-        """
-        raise NotImplementedError
