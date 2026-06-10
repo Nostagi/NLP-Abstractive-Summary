@@ -61,21 +61,18 @@ class Network(ABC, nn.Module):
         """
         pass
 
-    def save_state(self, base_dir: str, version: str = "default", optimizer=None, scheduler=None) -> str:
+    def save_state(self, save_folder: str, optimizer=None, scheduler=None) -> str:
         """
         Lưu trạng thái và cấu hình mạng vào một folder con sinh theo thời gian thực.
         
         Args:
-            base_dir: Thư mục gốc chứa các bản lưu.
-            filename: tên đánh dấu phiên bản.
+            save_folder: Đường dẫn tới thư mục được tạo.
             optimizer: Đối tượng optimizer từ PyTorch (tùy chọn).
             scheduler: Đối tượng learning rate scheduler từ PyTorch (tùy chọn).
         Returns:
-            save_folder: Đường dẫn tới thư mục vừa được tạo.
+            
         """
-        # Tạo tên folder theo thời gian (VD: 20231025_143000)
-        save_folder = os.path.join(base_dir, "_" + version)
-        
+
         os.makedirs(save_folder, exist_ok=True)
         
         # 1. Lưu trọng số (state_dict)
@@ -129,7 +126,7 @@ class Network(ABC, nn.Module):
         
         # 3. Nạp trọng số
         state_dict = torch.load(weights_path, map_location=torch.device(device), weights_only=True)
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=False)
         model.to(device)
         
         optimizer_state = None

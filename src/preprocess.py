@@ -26,7 +26,7 @@ class BPETokenizer:
         Args:
             config (ModelConfig): Đối tượng chứa các tham số cấu hình cho tokenizer.
         """
-        self.vocab_size = config.vocab_size
+        self.config = config
         self.special_tokens = config.special_tokens
 
         # 1. Khởi tạo mô hình BPE trống (chưa có từ điển)
@@ -126,6 +126,10 @@ class BPETokenizer:
             
         instance = cls(config)
         instance.tokenizer = Tokenizer.from_file(json_path)
+
         print(f"[Info] Đã tải thành công Tokenizer từ: {save_folder}")
         
         return instance
+    
+    def vocab_size(self) -> int:
+        return self.tokenizer.get_vocab_size(True)

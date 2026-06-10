@@ -9,45 +9,6 @@ from .embedding import PositionalEncoding
 from .interfaces import Network
 
 
-# ------------------
-# Components of the Transformer
-# ------------------
-
-class Encoder(nn.Module):
-
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, num_layers: int, dropout: float = 0.1):
-        super(Encoder, self).__init__()
-
-        encoder_layer = EncoderBlock(d_model, num_heads, d_ff, dropout)
-        self.layers = nn.ModuleList([copy(encoder_layer) for _ in range(num_layers)])  
-
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(x, mask)
-
-        return self.norm(x)
-
-class Decoder(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, num_layers: int, dropout: float = 0.1):
-        super().__init__()
-        self.num_layers = num_layers
-        
-        decoder_layer = DecoderBlock(d_model, num_heads, d_ff, dropout)
-        
-        self.layers = nn.ModuleList([copy(decoder_layer) for _ in range(num_layers)])
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, x: torch.Tensor, enc_output: torch.Tensor, 
-                source_mask: torch.Tensor = None, target_mask: torch.Tensor = None) -> torch.Tensor:
-        
-        for layer in self.layers:
-            x = layer(x, enc_output, source_mask, target_mask)
-            
-        return self.norm(x)
-    
-    
 class Transformer(Network):
     def __init__(self, 
                  vocab_size: int,
@@ -145,7 +106,7 @@ class Transformer(Network):
         
         # 2. Encoder-Decoder
         enc_output = self.encoder(source_embedded, mask=src_mask)
-        dec_output = self.decoder(target_embedded, enc_output, source_mask=src_mask, target_mask=tgt_mask)
+        dec_output, _ = self.decoder(target_embedded, enc_output, source_mask=src_mask, target_mask=tgt_mask, cache=None)
         
         # 3. Output Projection
         logits = self.output_projection(dec_output)
@@ -169,7 +130,27 @@ class Transformer(Network):
         }
     
     @torch.no_grad()
-    def generate(self, source_ids: torch.Tensor, eos_id: int, device: torch.device = None) -> torch.Tensor:
+    def _decode_step(self, next_token: torch.Tensor, enc_output: torch.Tensor, 
+                     src_mask: torch.Tensor, cache: list = None, step: int = 0):
+        
+        # TRICK: Khi dùng KV-Cache (chỉ nạp 1 token), KHÔNG cần dùng Causal Mask nữa!
+        tgt_mask = None 
+
+        # Đưa token duy nhất đi qua nhúng và Positional Encoding kết hợp với bước `step`
+        target_embedded = self.positional_encoding(self.embedding(next_token), step=step)
+
+        # Trả về cả logits và cache mới
+        dec_output, new_cache = self.decoder(
+            target_embedded, enc_output, 
+            source_mask=src_mask, target_mask=tgt_mask, 
+            cache=cache
+        )
+
+        logits = self.output_projection(dec_output) 
+        return logits[:, -1, :], new_cache
+
+    @torch.no_grad()
+    def generate(self, source_ids: torch.Tensor, eos_id: int, device: torch.device = 'auto') -> torch.Tensor:
         """
         Hàm sinh tự hồi quy dựa trên kiến trúc forward chuẩn của mô hình.
         
@@ -182,65 +163,138 @@ class Transformer(Network):
         Output:
             target_ids: [batch_size, generated_seq_len]
         """
-        self.eval() # Chuyển sang chế độ inference (tắt Dropout)
-        
+
+        self.eval()
         batch_size = source_ids.size(0)
         source_ids = source_ids.to(device)
 
-        # ==========================================
-        # 1. ENCODER (Chỉ tính toán 1 lần duy nhất)
-        # ==========================================
+        # 1. ENCODER
         src_mask = self.make_padding_mask(source_ids)
-        
-        # Nhúng (Embed) dữ liệu đầu vào y hệt như trong hàm forward
         source_embedded = self.positional_encoding(self.embedding(source_ids))
-        
-        # Trích xuất đặc trưng (Memory) từ Encoder
         enc_output = self.encoder(source_embedded, mask=src_mask)
 
-        # ==========================================
-        # 2. KHỞI TẠO DECODER
-        # ==========================================
-        # Bắt đầu với thẻ <BOS>
-        target_ids = torch.full((batch_size, 1), self.pad_id, dtype=torch.long, device=device)
+        # 2. KHỞI TẠO
+        next_token = torch.full((batch_size, 1), self.pad_id, dtype=torch.long, device=device)
+        target_ids = next_token
+        cache = None
 
-        # ==========================================
-        # 3. VÒNG LẶP AUTO-REGRESSIVE (Sinh từng từ)
-        # ==========================================
-        for _ in range(self.seq_max_length):
-            # 3.1. Tạo Causal Mask cho độ dài target hiện tại
-            tgt_mask = self.make_causal_mask(target_ids)
-
-            # 3.2. Nhúng chuỗi target hiện tại (Biến ID thành Vector)
-            target_embedded = self.positional_encoding(self.embedding(target_ids))
-
-            # 3.3. Đưa qua Decoder
-            dec_output = self.decoder(
-                target_embedded, 
-                enc_output,             # Kết quả từ Encoder ở bước 1
-                source_mask=src_mask, 
-                target_mask=tgt_mask
-            )
-
-            # 3.4. Đưa qua lớp Linear để dự đoán từ tiếp theo
-            logits = self.output_projection(dec_output) # [batch_size, current_seq_len, vocab_size]
-
-            # Lấy xác suất của token ở vị trí cuối cùng
-            next_token_logits = logits[:, -1, :] # [batch_size, vocab_size]
+        # 3. VÒNG LẶP SINH TỪ (Chỉ đưa next_token vào model, không đưa cả mảng target_ids)
+        for step in range(self.seq_max_length):
             
-            # Chọn token có xác suất cao nhất (Greedy Search)
-            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True) # [batch_size, 1]
-
-            # 3.5. Cập nhật chuỗi target
+            # Tính toán dựa trên token duy nhất và nối cache
+            next_token_logits, cache = self._decode_step(next_token, enc_output, src_mask, cache, step)
+            
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
             target_ids = torch.cat([target_ids, next_token], dim=1)
 
-            # 3.6. Điều kiện dừng: Bắt gặp thẻ <EOS>
-            # (Hàm .all() đảm bảo nếu batch_size > 1, tất cả các câu đều phải sinh ra EOS mới dừng)
             if (next_token == eos_id).all():
                 break
 
         return target_ids
 
+    @torch.no_grad()
+    def beam_search(self, source_ids: torch.Tensor, eos_id: int, beam_width: int = 3, device: torch.device = None) -> torch.Tensor:
+        """
+        Sinh văn bản bằng thuật toán Beam Search. Giữ lại Top-K nhánh tiềm năng nhất.
+        Hỗ trợ batch_size = 1.
+        """
+        self.eval()
+        source_ids = source_ids.to(device)
+
+        src_mask = self.make_padding_mask(source_ids)
+        source_embedded = self.positional_encoding(self.embedding(source_ids))
+        enc_output = self.encoder(source_embedded, mask=src_mask)
+
+        start_token = torch.full((1, 1), self.pad_id, dtype=torch.long, device=device)
+        
+        # MỖI BEAM LƯU 3 TRƯỜNG: (sequence, tổng điểm, cache của riêng nhánh đó)
+        beams = [(start_token, 0.0, None)] 
+
+        for step in range(self.seq_max_length):
+            new_beams = []
+            
+            for seq, score, cache in beams:
+                if seq[0, -1].item() == eos_id:
+                    new_beams.append((seq, score, cache))
+                    continue
+                
+                # CHỈ lấy duy nhất token cuối cùng của chuỗi để đưa vào dự đoán
+                next_token = seq[:, -1:] 
+                next_token_logits, new_cache = self._decode_step(next_token, enc_output, src_mask, cache, step)
+
+                # --- Repetition Penalty ---
+                generated_ids = seq[0].tolist()
+                repetition_penalty = 1.5
+                for token_id in set(generated_ids):
+                    if next_token_logits[0, token_id] < 0:
+                        next_token_logits[0, token_id] *= repetition_penalty
+                    else:
+                        next_token_logits[0, token_id] /= repetition_penalty
+                
+                log_probs = F.log_softmax(next_token_logits, dim=-1)
+                topk_log_probs, topk_indices = torch.topk(log_probs[0], beam_width)
+                
+                for i in range(beam_width):
+                    tok = topk_indices[i].unsqueeze(0).unsqueeze(0)
+                    new_seq = torch.cat([seq, tok], dim=1)
+                    new_score = score + topk_log_probs[i].item() 
+                    
+                    # Truyền cache mới sinh ra vào nhánh con
+                    new_beams.append((new_seq, new_score, new_cache))
+            
+            beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_width]
+            
+            if all(seq[0, -1].item() == eos_id for seq, score, cache in beams):
+                break
+
+        best_seq = beams[0][0]
+        return best_seq
+
+
+# ------------------
+# Components of the Transformer
+# ------------------
+
+class Encoder(nn.Module):
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, num_layers: int, dropout: float = 0.1):
+        super(Encoder, self).__init__()
+
+        encoder_layer = EncoderBlock(d_model, num_heads, d_ff, dropout)
+        self.layers = nn.ModuleList([copy(encoder_layer) for _ in range(num_layers)])  
+
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, mask)
+
+        return self.norm(x)
+
+class Decoder(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, num_layers: int, dropout: float = 0.1):
+        super().__init__()
+        self.num_layers = num_layers
+        
+        decoder_layer = DecoderBlock(d_model, num_heads, d_ff, dropout)
+        
+        self.layers = nn.ModuleList([copy(decoder_layer) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, enc_output: torch.Tensor, 
+                source_mask: torch.Tensor = None, target_mask: torch.Tensor = None,
+                new_cache = []) -> torch.Tensor:
+        
+        if cache is None:
+            cache = [None] * self.num_layers
+
+        new_cache = []
+        for layer in self.layers:
+            x, layer_new_cache = layer(x, enc_output, source_mask, target_mask)
+            new_cache.append(layer_new_cache)
+            
+        return self.norm(x), new_cache
+    
 # ------------------
 # Bigger blocks
 # ------------------
@@ -260,7 +314,7 @@ class EncoderBlock(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None,) -> torch.Tensor:
         """
         Defines the forward pass of the Encoder block.
         Pre-Norm architecture.
@@ -272,7 +326,7 @@ class EncoderBlock(nn.Module):
             [batch_size, seq_len, d_model]
         """
         x_norm = self.norm1(x)
-        x_output = self.self_attention(q=x_norm, k=x_norm, v=x_norm, mask=mask)
+        x_output, _ = self.self_attention(q=x_norm, k=x_norm, v=x_norm, mask=mask)
         x = x + self.dropout1(x_output)  # Residual connection + LayerNorm
 
         x_norm = self.norm2(x)
@@ -305,17 +359,31 @@ class DecoderBlock(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, enc_output: torch.Tensor, 
-                source_mask: torch.Tensor = None, target_mask: torch.Tensor = None) -> torch.Tensor:
+                source_mask: torch.Tensor = None, target_mask: torch.Tensor = None,
+                layer_cache: dict = None) -> torch.Tensor:
+
+        if layer_cache is None:
+            layer_cache = {'self': None, 'cross': None}
 
         x_norm = self.norm1(x)
-        x_output = self.self_attn(q=x_norm, k=x_norm, v=x_norm, mask=target_mask)
+        x_output, new_self_cache = self.self_attn(
+            q=x_norm, k=x_norm, v=x_norm, 
+            mask=target_mask, 
+            kv_cache=layer_cache['self'], 
+            is_cross_attn=False
+        )
         x = x + self.dropout1(x_output)  # Residual connection + LayerNorm
         
 
         # Q: là x (thông tin từ Decoder)
         # K, V: là enc_output (thông tin từ Encoder)
         x_norm = self.norm2(x)
-        x_output = self.cross_attn(q=x_norm, k=enc_output, v=enc_output, mask=source_mask)
+        x_output, new_cross_cache = self.cross_attn(
+            q=x_norm, k=enc_output, v=enc_output, 
+            mask=source_mask, 
+            kv_cache=layer_cache['cross'], 
+            is_cross_attn=True
+        )
         x = x + self.dropout2(x_output)  # Residual connection + LayerNorm
 
         
@@ -323,8 +391,11 @@ class DecoderBlock(nn.Module):
         x_output = self.ffn(x_norm)
         x = x + self.dropout3(x_output)  # Residual connection + LayerNorm
         
-        return x
+        new_cache = {'self': new_self_cache, 
+                     'cross': new_cross_cache}
 
+
+        return x, new_cache
 # ------------------
 # Smaller layers (inside the bigger blocks)
 # ------------------
@@ -451,7 +522,9 @@ class MultiHeadAttention(nn.Module):
         # Tái sử dụng single-head attention
         self.attention = ScaledDotProductAttention(dropout)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor = None):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor = None,
+                kv_cache: tuple = None, 
+                is_cross_attn: bool = False):
         batch_size = q.size(0)
         
         # 1. Đưa Q, K, V qua các lớp Linear Projector
@@ -464,8 +537,21 @@ class MultiHeadAttention(nn.Module):
         # Bước B: transpose(1, 2) để tráo đổi vị trí của seq_len và num_heads cho nhau
         #   -> Shape cuối: [batch_size, num_heads, seq_len, d_k]
         Q = Q.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        K = K.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        V = V.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+
+        if is_cross_attn and kv_cache is not None:
+            K, V = kv_cache
+        else:
+            # Nếu chưa có, tính K và V
+            K = self.w_k(k).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+            V = self.w_v(v).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+            
+            # Nối tiếp (Concatenate) K, V hiện tại với K, V trong quá khứ (chỉ áp dụng cho Self-Attention)
+            if not is_cross_attn and kv_cache is not None:
+                K = torch.cat([kv_cache[0], K], dim=2)
+                V = torch.cat([kv_cache[1], V], dim=2)
+                
+        # Cập nhật cache mới để trả ra ngoài
+        new_cache = (K, V)
         
         # 3. Tính Attention trên nhiều heads (cùng lúc)
         scores, attention_weights = self.attention(Q, K, V, mask)
@@ -481,4 +567,4 @@ class MultiHeadAttention(nn.Module):
         # Final Shape: [batch_size, seq_len, d_model]
         output = self.w_o(concat)
         
-        return output
+        return output, new_cache

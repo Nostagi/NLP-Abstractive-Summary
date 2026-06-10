@@ -1,6 +1,10 @@
 import evaluate
-from typing import Union, Sequence, Dict, Any
+from typing import Union, Sequence, Dict, Any, List
 import pandas as pd
+import json
+import requests
+from tqdm import tqdm
+import traceback
 
 # -------------------------
 # Evaluation
@@ -31,14 +35,19 @@ class MultiEvaluator:
 
         print("[Info] Đang tải các mô hình đánh giá. Việc này có thể mất chút thời gian...")
 
-        for metric_name in metric_configs.keys():
+        for metric_name, config in metric_configs.items():
             # evaluate.load() sẽ tải script chuẩn hoặc kéo model từ Hugging Face Hub về
-            self.metrics[metric_name] = evaluate.load(metric_name)
+            match metric_name:
+                case name if name.startswith("llm") :
+                    self.metrics[metric_name] = LLMEvaluator(config)
+                case _ :
+                    self.metrics[metric_name] = evaluate.load(metric_name)
             print(f"[Info] Đã tải xong metric: {metric_name}")
 
     def score_batch(self, 
                     references: Union[Sequence[str], pd.Series], 
-                    predictions: Union[Sequence[str], pd.Series]) -> pd.DataFrame:
+                    predictions: Union[Sequence[str], pd.Series],
+                    originals: Union[Sequence[str], pd.Series] = None) -> pd.DataFrame:
         """
         Tính điểm hàng loạt và trả về DataFrame.
         """
@@ -65,6 +74,8 @@ class MultiEvaluator:
                 
             # Chạy tính toán (Hugging Face tự lo tối ưu batch bên dưới)
             match metric_name:
+                case name if name.startswith("llm") :
+                    raw_scores = metric.compute(originals, references, predictions)
                 case _ :
                     raw_scores = metric.compute(predictions=predictions, references=references, **kwargs)
             
@@ -87,3 +98,144 @@ class MultiEvaluator:
 
         # 4. Trả về DataFrame
         return pd.DataFrame(all_results)
+    
+        
+class LLMEvaluator:
+    """
+    Trình đánh giá sử dụng LLM (LLM-as-a-Judge).
+    Hỗ trợ kết nối qua Ollama, Groq API, hoặc chạy Local qua HuggingFace (Transformers).
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.provider = config.get("provider", "ollama").lower()
+        self.model_name = config.get("model_name", "qwen0.5")
+        
+        self.prompt = config.get("prompt")
+        self.response_key = config.get("response_key")
+
+        assert (self.prompt is not None), f"[ERROR] LLM Evaluator needs to have Prompt, which is: \n{self.prompt}"
+        assert (self.response_key is not None), "[ERROR] LLM Evaluator needs to have List of Response Key, which is \n{self.response_key}"
+        
+        print(f"[Info] Khởi tạo LLMEvaluator với provider: {self.provider.upper()}, model: {self.model_name}")
+
+        if self.provider == "local":
+            from transformers import pipeline
+            import torch
+            # Tải model từ Hugging Face vào RAM/VRAM
+            self.pipe = pipeline(
+                "text-generation", 
+                model=self.model_name, 
+                model_kwargs={"dtype": torch.float16}, # Giảm bộ nhớ
+                device_map="auto"
+            )
+
+            self.pipe.model.generation_config.max_length = None
+            self.pipe.model.generation_config.max_new_tokens = 150
+            
+        elif self.provider == "groq":
+            from groq import Groq
+            self.api_key = config.get("api_key")
+            if not self.api_key:
+                raise ValueError("[ERROR] Thiếu 'api_key' cho Groq.")
+            self.client = Groq(api_key=self.api_key)
+            
+        elif self.provider == "ollama":
+            # Mặc định gọi đến REST API của Ollama chạy ở localhost
+            self.url = config.get("url", "http://localhost:11434/api/generate")
+
+    def _build_prompt(self, original: str, reference: str, prediction: str) -> str:
+        """
+        Prompt Template tạm thời. Bạn có thể thay đổi cụ thể sau.
+        Lưu ý: 
+        - Bắt buộc LLM phải trả về chuẩn JSON để parse tự động.
+        - Bắt buộc phải khai báo đồng bộ response_key để đảm bảo kết quả trả về.
+        """
+
+        data = {
+            "original" : original,
+            "reference" : reference,
+            "prediction" : prediction
+        }
+
+        return self.prompt.format(**data)
+
+    def _parse_llm_response(self, text: str) -> Dict[str, Any]:
+        """Trích xuất JSON từ chuỗi văn bản trả về của LLM."""
+        response = {}
+
+        try:
+            # Tìm vị trí bắt đầu và kết thúc của chuỗi JSON
+            start = text.find('{')
+            end = text.rfind('}') + 1
+            
+            if start != -1 and end != 0:
+                json_str = text[start:end]
+                parsed_json = json.loads(json_str)
+                
+                # 2. Lọc và ánh xạ dữ liệu chuẩn với self.response_key
+                for key in self.response_key:
+                    # Dùng .get() để an toàn: nếu LLM quên sinh ra key này, nó sẽ lấy giá trị từ fallback
+                    response[key] = parsed_json.get(key, 0)
+            
+            return response
+            
+        except json.JSONDecodeError:
+            print(f"[Cảnh báo] Không thể parse JSON từ LLM output: {text}")
+            return response
+
+    def compute(self, original: List[str], references: List[str], predictions: List[str]) -> Dict[str, List[Any]]:
+        # Khởi tạo format kết quả để trả về cho MultiEvaluator
+        results = {key: [] for key in self.response_key}
+        
+        # Xử lý trường hợp không truyền bài gốc (original)
+        if original is None:
+            original = ["(Không cung cấp)"] * len(references)
+
+        progress_bar = tqdm(zip(original, references, predictions), total=len(predictions), desc="LLM judge progress: ", leave=True)
+
+        for sample in progress_bar:
+            orig, ref, pred = sample
+
+            prompt = self._build_prompt(orig, ref, pred)
+            response_text = ""
+
+            try:
+                if self.provider == "ollama":
+                    payload = {
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "format": "json" # Ép Ollama trả về JSON
+                    }
+                    res = requests.post(self.url, json=payload)
+                    response_text = res.json().get("response", "")
+
+                elif self.provider == "groq":
+                    chat_completion = self.client.chat.completions.create(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=self.model_name,
+                        response_format={"type": "json_object"} # Ép Groq trả JSON
+                    )
+                    response_text = chat_completion.choices[0].message.content
+
+                elif self.provider == "local":
+                    # Đối với Local Model, prompt format có thể cần chat template
+                    messages = [{"role": "user", "content": prompt}]
+                    out = self.pipe(
+                        messages, 
+                        return_full_text=False
+                    )
+
+                    response_text = out[0]['generated_text']
+
+                # Parse JSON và lưu vào kết quả
+                scores = self._parse_llm_response(response_text)
+                for key in self.response_key:
+                    results[key].append(scores[key])
+
+            except Exception as e:
+                print(f"[Lỗi] Fail khi đánh giá mẫu: {e}")
+                traceback.print_exc()
+                for key in results.keys():
+                    results[key].append(0.0) # Fallback điểm 0 nếu lỗi
+
+        return results
