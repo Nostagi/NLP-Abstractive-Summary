@@ -283,7 +283,7 @@ class Decoder(nn.Module):
 
     def forward(self, x: torch.Tensor, enc_output: torch.Tensor, 
                 source_mask: torch.Tensor = None, target_mask: torch.Tensor = None,
-                new_cache = []) -> torch.Tensor:
+                cache = []) -> torch.Tensor:
         
         if cache is None:
             cache = [None] * self.num_layers

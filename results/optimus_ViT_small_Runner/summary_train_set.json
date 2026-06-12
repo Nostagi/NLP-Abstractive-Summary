@@ -1,0 +1,54 @@
+{
+    "model_name": "Transformer",
+    "num_records": 100,
+    "metrics": {
+        "rouge1": {
+            "mean": "0.779",
+            "std": "0.068",
+            "min": "0.609",
+            "max": "0.943"
+        },
+        "rouge2": {
+            "mean": "0.580",
+            "std": "0.128",
+            "min": "0.256",
+            "max": "0.919"
+        },
+        "rouge3": {
+            "mean": "0.492",
+            "std": "0.157",
+            "min": "0.111",
+            "max": "0.903"
+        },
+        "rougeL": {
+            "mean": "0.601",
+            "std": "0.129",
+            "min": "0.342",
+            "max": "0.935"
+        },
+        "rougeLsum": {
+            "mean": "0.601",
+            "std": "0.129",
+            "min": "0.342",
+            "max": "0.935"
+        },
+        "bertscore_precision": {
+            "mean": "0.821",
+            "std": "0.048",
+            "min": "0.691",
+            "max": "0.921"
+        },
+        "bertscore_recall": {
+            "mean": "0.827",
+            "std": "0.045",
+            "min": "0.705",
+            "max": "0.936"
+        },
+        "bertscore_f1": {
+            "mean": "0.824",
+            "std": "0.044",
+            "min": "0.703",
+            "max": "0.920"
+        }
+    }
+}

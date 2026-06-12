@@ -1,4 +1,4 @@
-from .embedding import RotaryPositionalEmbedding, PositionalEncodingBypass
+from .embedding import RotaryPositionalEmbedding
 from .transformer import ScaledDotProductAttention
 from . import transformer as traditional
 
@@ -272,7 +272,7 @@ class RMSNorm(nn.Module):
         """
         super().__init__()
         self.eps = eps
-        # Tham số gamma học được, khởi tạo bằng 1
+        
         self.weight = nn.Parameter(torch.ones(d_model))
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
